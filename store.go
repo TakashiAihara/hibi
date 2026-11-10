@@ -1,0 +1,132 @@
+package main
+
+import (
+	"database/sql"
+	"errors"
+	"time"
+
+	_ "modernc.org/sqlite"
+)
+
+type Entry struct {
+	Date      string `json:"date"`
+	Body      string `json:"body"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+// Value is nil for a plain "done" check and set for measured habits (steps, minutes).
+type HabitLog struct {
+	Date      string   `json:"date"`
+	Habit     string   `json:"habit"`
+	Value     *float64 `json:"value"`
+	UpdatedAt string   `json:"updated_at"`
+}
+
+type Store struct{ db *sql.DB }
+
+var ErrNotFound = errors.New("not found")
+
+const schema = `
+CREATE TABLE IF NOT EXISTS entries (
+	date       TEXT PRIMARY KEY,
+	body       TEXT NOT NULL,
+	updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS habit_logs (
+	date       TEXT NOT NULL,
+	habit      TEXT NOT NULL,
+	value      REAL,
+	updated_at TEXT NOT NULL,
+	PRIMARY KEY (date, habit)
+);`
+
+func OpenStore(path string) (*Store, error) {
+	// WAL lets the web UI read while a client writes; busy_timeout avoids SQLITE_BUSY on overlap.
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
+	if err != nil {
+		return nil, err
+	}
+	if _, err := db.Exec(schema); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return &Store{db: db}, nil
+}
+
+func (s *Store) Close() error { return s.db.Close() }
+
+func now() string { return time.Now().UTC().Format(time.RFC3339) }
+
+func (s *Store) PutEntry(date, body string) (Entry, error) {
+	e := Entry{Date: date, Body: body, UpdatedAt: now()}
+	_, err := s.db.Exec(`INSERT INTO entries (date, body, updated_at) VALUES (?, ?, ?)
+		ON CONFLICT(date) DO UPDATE SET body = excluded.body, updated_at = excluded.updated_at`,
+		e.Date, e.Body, e.UpdatedAt)
+	return e, err
+}
+
+func (s *Store) GetEntry(date string) (Entry, error) {
+	var e Entry
+	err := s.db.QueryRow(`SELECT date, body, updated_at FROM entries WHERE date = ?`, date).
+		Scan(&e.Date, &e.Body, &e.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return e, ErrNotFound
+	}
+	return e, err
+}
+
+// ListEntries returns entries in [from, to], newest first. ISO dates sort lexically.
+func (s *Store) ListEntries(from, to string) ([]Entry, error) {
+	rows, err := s.db.Query(`SELECT date, body, updated_at FROM entries
+		WHERE date >= ? AND date <= ? ORDER BY date DESC`, from, to)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Entry{}
+	for rows.Next() {
+		var e Entry
+		if err := rows.Scan(&e.Date, &e.Body, &e.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) PutHabit(date, habit string, value *float64) (HabitLog, error) {
+	h := HabitLog{Date: date, Habit: habit, Value: value, UpdatedAt: now()}
+	_, err := s.db.Exec(`INSERT INTO habit_logs (date, habit, value, updated_at) VALUES (?, ?, ?, ?)
+		ON CONFLICT(date, habit) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+		h.Date, h.Habit, h.Value, h.UpdatedAt)
+	return h, err
+}
+
+func (s *Store) DeleteHabit(date, habit string) error {
+	res, err := s.db.Exec(`DELETE FROM habit_logs WHERE date = ? AND habit = ?`, date, habit)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) ListHabits(date string) ([]HabitLog, error) {
+	rows, err := s.db.Query(`SELECT date, habit, value, updated_at FROM habit_logs
+		WHERE date = ? ORDER BY habit`, date)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []HabitLog{}
+	for rows.Next() {
+		var h HabitLog
+		if err := rows.Scan(&h.Date, &h.Habit, &h.Value, &h.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, h)
+	}
+	return out, rows.Err()
+}
