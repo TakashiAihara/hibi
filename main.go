@@ -159,7 +159,11 @@ func serveUntil(ctx context.Context, l net.Listener, h http.Handler) error {
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		return srv.Shutdown(shutdownCtx)
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			srv.Close()
+			return fmt.Errorf("shutdown: requests still running after 5s were cut: %w", err)
+		}
+		return nil
 	}
 }
 

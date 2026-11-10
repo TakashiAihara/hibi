@@ -109,6 +109,9 @@ func TestEmptyBodyOfUnknownLengthIsPlainCheck(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("empty body with unknown length: got %d %s, want 200", rec.Code, rec.Body)
 	}
+	if hs, err := st.ListHabits("2026-11-10"); err != nil || len(hs) != 1 || hs[0].Habit != "stretch" || hs[0].Value != nil {
+		t.Errorf("stored after empty body: got %+v %v, want stretch with null value", hs, err)
+	}
 }
 
 func TestDBFileIsOwnerOnly(t *testing.T) {
@@ -450,6 +453,11 @@ func TestShutdownLetsInFlightRequestFinish(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	cancel()
 	time.Sleep(100 * time.Millisecond)
+	select {
+	case err := <-done:
+		t.Fatalf("serveUntil returned while a request was in flight: %v", err)
+	default:
+	}
 	pw.Write([]byte(`"finished"}`))
 	pw.Close()
 
@@ -471,6 +479,8 @@ func TestShutdownLetsInFlightRequestFinish(t *testing.T) {
 
 func TestStoreRejectsDSNLikePaths(t *testing.T) {
 	dir := t.TempDir()
+	// A broken check would create ":memory:" relative to cwd; keep it inside the temp dir.
+	t.Chdir(dir)
 	for _, p := range []string{filepath.Join(dir, "a?b.db"), "file:" + filepath.Join(dir, "x.db"), ":memory:"} {
 		if _, err := OpenStore(p); err == nil || !strings.Contains(err.Error(), "plain file path") {
 			t.Errorf("OpenStore(%q): got %v, want rejection", p, err)

@@ -49,7 +49,7 @@ func OpenStore(path string) (*Store, error) {
 		return nil, fmt.Errorf("HIBI_DB must be a plain file path: %q", path)
 	}
 	// The diary is private: create the file owner-only before SQLite creates it with the umask.
-	// Chmod as well, so a file created earlier with a looser mode is tightened too; via the descriptor, so a swapped path cannot redirect it.
+	// Chmod as well, so a file created earlier with a looser mode is tightened too.
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		return nil, err
