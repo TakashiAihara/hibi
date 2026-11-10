@@ -119,7 +119,8 @@ func serve() error {
 	defer st.Close()
 	addr := envOr("HIBI_ADDR", ":8080")
 	log.Printf("listening on %s", addr)
-	srv := &http.Server{Addr: addr, Handler: NewServer(st, token), ReadHeaderTimeout: 10 * time.Second}
+	srv := &http.Server{Addr: addr, Handler: NewServer(st, token),
+		ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 2 * time.Minute}
 	return srv.ListenAndServe()
 }
 

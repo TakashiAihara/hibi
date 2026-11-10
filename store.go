@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"errors"
+	"os"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -41,11 +42,18 @@ CREATE TABLE IF NOT EXISTS habit_logs (
 );`
 
 func OpenStore(path string) (*Store, error) {
-	// WAL lets the web UI read while a client writes; busy_timeout avoids SQLITE_BUSY on overlap.
-	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
+	// The diary is private: create the file owner-only before SQLite creates it with the umask.
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		return nil, err
 	}
+	f.Close()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return nil, err
+	}
+	// One connection serializes writes, so concurrent requests queue in Go instead of failing with SQLITE_BUSY.
+	db.SetMaxOpenConns(1)
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, err
@@ -107,7 +115,11 @@ func (s *Store) DeleteHabit(date, habit string) error {
 	if err != nil {
 		return err
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
 		return ErrNotFound
 	}
 	return nil

@@ -4,6 +4,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"net/http"
 	"regexp"
@@ -65,8 +66,8 @@ func NewServer(st *Store, token string) http.Handler {
 		var in struct {
 			Value *float64 `json:"value"`
 		}
-		// An empty request body means a plain "done" check.
-		if r.ContentLength != 0 && !decode(w, r, &in) {
+		// An empty request body means a plain "done" check, whatever Content-Length says (chunked is -1).
+		if !decodeOptional(w, r, &in) {
 			return
 		}
 		h, err := st.PutHabit(date, habit, in.Value)
@@ -88,6 +89,7 @@ func auth(token string, next http.Handler) http.Handler {
 	want := []byte("Bearer " + token)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/healthz" && subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), want) != 1 {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="hibi"`)
 			httpErr(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
@@ -118,9 +120,24 @@ func withHabit(h func(http.ResponseWriter, *http.Request, string, string)) http.
 }
 
 func decode(w http.ResponseWriter, r *http.Request, v any) bool {
+	return decodeBody(w, r, v, false)
+}
+
+func decodeOptional(w http.ResponseWriter, r *http.Request, v any) bool {
+	return decodeBody(w, r, v, true)
+}
+
+func decodeBody(w http.ResponseWriter, r *http.Request, v any, allowEmpty bool) bool {
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBody))
 	dec.DisallowUnknownFields()
-	if err := dec.Decode(v); err != nil {
+	err := dec.Decode(v)
+	if allowEmpty && errors.Is(err, io.EOF) {
+		return true
+	}
+	if err == nil && dec.Decode(&struct{}{}) != io.EOF {
+		err = errors.New("trailing data after JSON value")
+	}
+	if err != nil {
 		httpErr(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return false
 	}

@@ -14,7 +14,7 @@ HIBI_TOKEN=change-me HIBI_DB=./hibi.db HIBI_ADDR=127.0.0.1:8080 ./hibi serve
 | Variable | Default | Meaning |
 |---|---|---|
 | `HIBI_TOKEN` | (required) | Bearer token every request except `/healthz` must send |
-| `HIBI_DB` | `hibi.db` | SQLite file path |
+| `HIBI_DB` | `hibi.db` | SQLite file path. A new file is created with mode 0600 |
 | `HIBI_ADDR` | `:8080` | Listen address |
 
 The server does not restrict source addresses. Put it behind a reverse proxy that limits who can reach it.
@@ -30,7 +30,7 @@ echo "Wrote the API today" | ./hibi entry put today
 ./hibi habit list today
 ```
 
-Every command prints the JSON response. Errors go to stderr with exit code 1.
+Every command except `habit undo` prints the JSON response (`habit undo` prints nothing on success). Errors go to stderr with exit code 1. Text read from stdin is stored as is, including the trailing newline `echo` adds.
 
 ## API
 
