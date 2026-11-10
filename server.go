@@ -90,7 +90,10 @@ func auth(token string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// The auth scheme is case-insensitive (RFC 9110 11.1); webhook senders may send "bearer".
 		scheme, cred, _ := strings.Cut(r.Header.Get("Authorization"), " ")
-		ok := strings.EqualFold(scheme, "Bearer") && subtle.ConstantTimeCompare([]byte(cred), want) == 1
+		// RFC 9110 allows one or more spaces after the scheme.
+		cred = strings.TrimLeft(cred, " ")
+		// An empty token must never authenticate, even if a caller forgets serve's check.
+		ok := token != "" && strings.EqualFold(scheme, "Bearer") && subtle.ConstantTimeCompare([]byte(cred), want) == 1
 		if r.URL.Path != "/healthz" && !ok {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="hibi"`)
 			httpErr(w, http.StatusUnauthorized, "unauthorized")
@@ -122,6 +125,11 @@ func withHabit(h func(http.ResponseWriter, *http.Request, string, string)) http.
 	})
 }
 
+func isTooBig(err error) bool {
+	var tooBig *http.MaxBytesError
+	return errors.As(err, &tooBig)
+}
+
 func noContent(w http.ResponseWriter, err error) {
 	if err == nil {
 		w.WriteHeader(http.StatusNoContent)
@@ -145,11 +153,14 @@ func decodeBody(w http.ResponseWriter, r *http.Request, v any, allowEmpty bool) 
 	if allowEmpty && errors.Is(err, io.EOF) {
 		return true
 	}
-	if err == nil && dec.Decode(&struct{}{}) != io.EOF {
-		err = errors.New("trailing data after JSON value")
+	if err == nil {
+		if err = dec.Decode(&struct{}{}); errors.Is(err, io.EOF) {
+			err = nil
+		} else if !isTooBig(err) {
+			err = errors.New("trailing data after JSON value")
+		}
 	}
-	var tooBig *http.MaxBytesError
-	if errors.As(err, &tooBig) {
+	if isTooBig(err) {
 		httpErr(w, http.StatusRequestEntityTooLarge, "request body over 1 MiB")
 		return false
 	}

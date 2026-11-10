@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -141,8 +143,16 @@ func TestConcurrentWritesDoNotFail(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			code, _ := call(t, srv, "PUT", fmt.Sprintf("/habits/2026-11-10/h%d", i%50), testToken, fmt.Sprintf(`{"value":%d}`, i))
-			codes <- code
+			// No t.Fatal here: FailNow must not be called from other goroutines.
+			req, _ := http.NewRequest("PUT", fmt.Sprintf("%s/habits/2026-11-10/h%d", srv.URL, i%50), strings.NewReader(fmt.Sprintf(`{"value":%d}`, i)))
+			req.Header.Set("Authorization", "Bearer "+testToken)
+			res, err := http.DefaultClient.Do(req)
+			if err != nil {
+				codes <- -1
+				return
+			}
+			res.Body.Close()
+			codes <- res.StatusCode
 		}()
 	}
 	wg.Wait()
@@ -168,7 +178,7 @@ func TestAPIDetails(t *testing.T) {
 	}
 
 	req, _ := http.NewRequest("PUT", srv.URL+"/entries/2026-11-10", strings.NewReader(`{"body":"lower-case scheme"}`))
-	req.Header.Set("Authorization", "bearer "+testToken)
+	req.Header.Set("Authorization", "bearer  "+testToken)
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -180,9 +190,16 @@ func TestAPIDetails(t *testing.T) {
 	if _, body := call(t, srv, "GET", "/entries", testToken, ""); !strings.Contains(body, `"2026-11-10"`) {
 		t.Errorf("list without bounds: got %s, want the 2026-11-10 entry", body)
 	}
-	big := `{"body":"` + strings.Repeat("a", maxBody) + `"}`
-	if code, _ := call(t, srv, "PUT", "/entries/2026-11-11", testToken, big); code != 413 {
-		t.Errorf("body over 1 MiB: got %d, want 413", code)
+	// Literal 1 MiB (README promises it); `{"body":""}` adds 11 bytes around the text.
+	const mib = 1 << 20
+	if code, _ := call(t, srv, "PUT", "/entries/2026-11-11", testToken, `{"body":"`+strings.Repeat("a", mib-11)+`"}`); code != 200 {
+		t.Errorf("body of exactly 1 MiB: got %d, want 200", code)
+	}
+	if code, _ := call(t, srv, "PUT", "/entries/2026-11-11", testToken, `{"body":"`+strings.Repeat("a", mib-10)+`"}`); code != 413 {
+		t.Errorf("body of 1 MiB + 1: got %d, want 413", code)
+	}
+	if code, _ := call(t, srv, "PUT", "/entries/2026-11-11", testToken, `{"body":"x"}`+strings.Repeat(" ", mib)); code != 413 {
+		t.Errorf("valid JSON padded past 1 MiB: got %d, want 413", code)
 	}
 	if code, _ := call(t, srv, "DELETE", "/entries/2026-11-10", testToken, ""); code != 204 {
 		t.Errorf("delete entry: got %d, want 204", code)
@@ -271,16 +288,16 @@ func TestEntryRoundTripViaCLI(t *testing.T) {
 
 func TestTodayUsesLocalDate(t *testing.T) {
 	setup(t)
-	orig := time.Local
-	defer func() { time.Local = orig }()
-	// +14h and -12h are 26h apart, so their dates always differ: a day() that ignores time.Local fails one.
+	orig := cliZone
+	defer func() { cliZone = orig }()
+	// +14h and -12h are 26h apart, so their dates always differ: a day() that ignores cliZone fails one.
 	for _, off := range []int{14, -12} {
-		time.Local = time.FixedZone("test", off*3600)
-		before := time.Now().Format(time.DateOnly)
+		cliZone = time.FixedZone("test", off*3600)
+		before := time.Now().In(cliZone).Format(time.DateOnly)
 		if _, err := cli(t, "", "entry", "put", "today", fmt.Sprintf("zone %d", off)); err != nil {
 			t.Fatal(err)
 		}
-		after := time.Now().Format(time.DateOnly)
+		after := time.Now().In(cliZone).Format(time.DateOnly)
 		out, _ := cli(t, "", "entry", "get", before)
 		out2, _ := cli(t, "", "entry", "get", after)
 		want := fmt.Sprintf(`"body":"zone %d"`, off)
@@ -375,6 +392,12 @@ func TestServeStartsAndShutsDownOnSignal(t *testing.T) {
 	if !up {
 		t.Fatal("serve did not answer /healthz within 1s")
 	}
+	select {
+	case err := <-done:
+		// Sending SIGINT now would hit the test binary itself.
+		t.Fatalf("serve returned before the signal: %v", err)
+	default:
+	}
 	start := time.Now()
 	syscall.Kill(os.Getpid(), syscall.SIGINT)
 	select {
@@ -392,5 +415,117 @@ func TestServeStartsAndShutsDownOnSignal(t *testing.T) {
 	t.Setenv("HIBI_TOKEN", "")
 	if err := run([]string{"serve"}, strings.NewReader(""), io.Discard); err == nil || !strings.Contains(err.Error(), "HIBI_TOKEN is required") {
 		t.Errorf("serve without token: got %v", err)
+	}
+}
+
+func TestShutdownLetsInFlightRequestFinish(t *testing.T) {
+	st, err := OpenStore(filepath.Join(t.TempDir(), "hibi.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- serveUntil(ctx, l, NewServer(st, testToken)) }()
+
+	// The body arrives in two halves, so the request is in flight when shutdown starts.
+	pr, pw := io.Pipe()
+	req, _ := http.NewRequest("PUT", "http://"+l.Addr().String()+"/entries/2026-11-10", pr)
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	resc := make(chan *http.Response, 1)
+	go func() {
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			resc <- nil
+			return
+		}
+		res.Body.Close()
+		resc <- res
+	}()
+	pw.Write([]byte(`{"body":`))
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+	time.Sleep(100 * time.Millisecond)
+	pw.Write([]byte(`"finished"}`))
+	pw.Close()
+
+	select {
+	case res := <-resc:
+		if res == nil || res.StatusCode != 200 {
+			t.Fatalf("in-flight request during shutdown: got %v, want 200", res)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("in-flight request did not complete")
+	}
+	if err := <-done; err != nil {
+		t.Errorf("serveUntil after cancel: got %v, want nil", err)
+	}
+	if e, err := st.GetEntry("2026-11-10"); err != nil || e.Body != "finished" {
+		t.Errorf("entry after shutdown: got %+v %v", e, err)
+	}
+}
+
+func TestStoreRejectsDSNLikePaths(t *testing.T) {
+	dir := t.TempDir()
+	for _, p := range []string{filepath.Join(dir, "a?b.db"), "file:" + filepath.Join(dir, "x.db"), ":memory:"} {
+		if _, err := OpenStore(p); err == nil || !strings.Contains(err.Error(), "plain file path") {
+			t.Errorf("OpenStore(%q): got %v, want rejection", p, err)
+		}
+	}
+}
+
+func TestEmptyTokenNeverAuthenticates(t *testing.T) {
+	st, err := OpenStore(filepath.Join(t.TempDir(), "hibi.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	srv := httptest.NewServer(NewServer(st, ""))
+	defer srv.Close()
+	for _, h := range []string{"Bearer ", "Bearer"} {
+		req, _ := http.NewRequest("GET", srv.URL+"/entries", nil)
+		req.Header.Set("Authorization", h)
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		if res.StatusCode != 401 {
+			t.Errorf("empty server token with %q: got %d, want 401", h, res.StatusCode)
+		}
+	}
+}
+
+func TestWaitsForOutsideWriter(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hibi.db")
+	st, err := OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	// Another process (an sqlite3 .backup, say) holds the write lock for 300ms.
+	other, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	conn, err := other.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.ExecContext(context.Background(), "BEGIN IMMEDIATE"); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		conn.ExecContext(context.Background(), "COMMIT")
+		conn.Close()
+	}()
+	if _, err := st.PutEntry("2026-11-10", "after the lock"); err != nil {
+		t.Errorf("write while another connection holds the lock: got %v, want it to wait", err)
 	}
 }

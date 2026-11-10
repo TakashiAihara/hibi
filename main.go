@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -84,10 +85,10 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 		}
 		q := url.Values{}
 		if *from != "" {
-			q.Set("from", day(*from))
+			q.Set("from", resolveDay(*from))
 		}
 		if *to != "" {
-			q.Set("to", day(*to))
+			q.Set("to", resolveDay(*to))
 		}
 		return c.do("GET", "/entries?"+q.Encode(), nil, stdout)
 	case cmd == "entry delete" && len(rest) == 1:
@@ -110,11 +111,17 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 	return errUsage
 }
 
-func day(s string) string {
+// cliZone is the zone "today" resolves in; a variable so tests can set it without racing on time.Local.
+var cliZone = time.Local
+
+// day is a DATE argument as a path segment; query values use resolveDay, since Encode escapes them.
+func day(s string) string { return url.PathEscape(resolveDay(s)) }
+
+func resolveDay(s string) string {
 	if s == "today" {
-		return time.Now().Format(time.DateOnly)
+		return time.Now().In(cliZone).Format(time.DateOnly)
 	}
-	return url.PathEscape(s)
+	return s
 }
 
 func serve() error {
@@ -127,20 +134,30 @@ func serve() error {
 		return err
 	}
 	defer st.Close()
-	addr := envOr("HIBI_ADDR", ":8080")
-	srv := &http.Server{Addr: addr, Handler: NewServer(st, token),
-		ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 2 * time.Minute}
+	l, err := net.Listen("tcp", envOr("HIBI_ADDR", ":8080"))
+	if err != nil {
+		return err
+	}
+	log.Printf("listening on %s, db %s", l.Addr(), envOr("HIBI_DB", "hibi.db"))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// Restore default signal handling once shutdown starts, so a second Ctrl-C kills at once.
+	go func() { <-ctx.Done(); stop() }()
+	return serveUntil(ctx, l, NewServer(st, token))
+}
+
+// serveUntil serves on l until ctx is done, then lets in-flight requests finish.
+// 5s stays under Docker's default 10s stop grace, so the deferred store close runs before SIGKILL.
+func serveUntil(ctx context.Context, l net.Listener, h http.Handler) error {
+	srv := &http.Server{Handler: h,
+		ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 2 * time.Minute}
 	errc := make(chan error, 1)
-	go func() { errc <- srv.ListenAndServe() }()
-	log.Printf("listening on %s, db %s", addr, envOr("HIBI_DB", "hibi.db"))
+	go func() { errc <- srv.Serve(l) }()
 	select {
 	case err := <-errc:
 		return err
 	case <-ctx.Done():
-		// Let in-flight writes finish before the deferred store close on container stop.
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		return srv.Shutdown(shutdownCtx)
 	}

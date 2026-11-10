@@ -3,7 +3,9 @@ package main
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -42,14 +44,19 @@ CREATE TABLE IF NOT EXISTS habit_logs (
 );`
 
 func OpenStore(path string) (*Store, error) {
+	// The driver reads "?" as the start of DSN options and "file:" as a URI, so such paths would open a different file.
+	if strings.Contains(path, "?") || strings.HasPrefix(path, "file:") || path == ":memory:" {
+		return nil, fmt.Errorf("HIBI_DB must be a plain file path: %q", path)
+	}
 	// The diary is private: create the file owner-only before SQLite creates it with the umask.
-	// Chmod as well, so a file created earlier with a looser mode is tightened too.
+	// Chmod as well, so a file created earlier with a looser mode is tightened too; via the descriptor, so a swapped path cannot redirect it.
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		return nil, err
 	}
+	err = f.Chmod(0o600)
 	f.Close()
-	if err := os.Chmod(path, 0o600); err != nil {
+	if err != nil {
 		return nil, err
 	}
 	// busy_timeout covers writers outside this process (an sqlite3 .backup run).

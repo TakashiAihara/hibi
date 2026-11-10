@@ -14,10 +14,10 @@ HIBI_TOKEN=change-me HIBI_DB=./hibi.db HIBI_ADDR=127.0.0.1:8080 ./hibi serve
 | Variable | Default | Meaning |
 |---|---|---|
 | `HIBI_TOKEN` | (required) | Bearer token every request except `/healthz` must send |
-| `HIBI_DB` | `hibi.db` | SQLite file path. Set it to a path on a persistent volume in containers. The file is set to mode 0600 on start |
+| `HIBI_DB` | `hibi.db` | Plain SQLite file path (no `?`, `file:` or `:memory:`). Set it to a path on a persistent volume in containers. The file is set to mode 0600 on start, so it must be owned by the server's user |
 | `HIBI_ADDR` | `:8080` | Listen address |
 
-The server does not restrict source addresses. Put it behind a reverse proxy that limits who can reach it. Request bodies are capped at 1 MiB (413 above that). SIGINT / SIGTERM stop it gracefully.
+The server does not restrict source addresses. Put it behind a reverse proxy that limits who can reach it. Request bodies are capped at 1 MiB (413 above that). SIGINT / SIGTERM stop it after in-flight requests finish (up to 5 seconds).
 
 ## Use the CLI
 
