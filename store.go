@@ -43,12 +43,17 @@ CREATE TABLE IF NOT EXISTS habit_logs (
 
 func OpenStore(path string) (*Store, error) {
 	// The diary is private: create the file owner-only before SQLite creates it with the umask.
+	// Chmod as well, so a file created earlier with a looser mode is tightened too.
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		return nil, err
 	}
 	f.Close()
-	db, err := sql.Open("sqlite", path)
+	if err := os.Chmod(path, 0o600); err != nil {
+		return nil, err
+	}
+	// busy_timeout covers writers outside this process (an sqlite3 .backup run).
+	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)")
 	if err != nil {
 		return nil, err
 	}
@@ -110,8 +115,15 @@ func (s *Store) PutHabit(date, habit string, value *float64) (HabitLog, error) {
 	return h, err
 }
 
+func (s *Store) DeleteEntry(date string) error {
+	return deleted(s.db.Exec(`DELETE FROM entries WHERE date = ?`, date))
+}
+
 func (s *Store) DeleteHabit(date, habit string) error {
-	res, err := s.db.Exec(`DELETE FROM habit_logs WHERE date = ? AND habit = ?`, date, habit)
+	return deleted(s.db.Exec(`DELETE FROM habit_logs WHERE date = ? AND habit = ?`, date, habit))
+}
+
+func deleted(res sql.Result, err error) error {
 	if err != nil {
 		return err
 	}

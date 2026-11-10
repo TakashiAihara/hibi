@@ -3,14 +3,18 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
-	"os"
-	"time"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
+	"time"
 )
 
 const testToken = "s3cret"
@@ -59,6 +63,16 @@ func TestAuth(t *testing.T) {
 	if code, _ := call(t, srv, "GET", "/entries", "wrong", ""); code != 401 {
 		t.Errorf("wrong token: got %d, want 401", code)
 	}
+	req, _ := http.NewRequest("GET", srv.URL+"/entries", nil)
+	req.Header.Set("Authorization", "Basic "+testToken)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != 401 {
+		t.Errorf("right token with Basic scheme: got %d, want 401", res.StatusCode)
+	}
 	if code, _ := call(t, srv, "GET", "/healthz", "", ""); code != 200 {
 		t.Errorf("healthz without token: got %d, want 200", code)
 	}
@@ -96,18 +110,85 @@ func TestEmptyBodyOfUnknownLengthIsPlainCheck(t *testing.T) {
 }
 
 func TestDBFileIsOwnerOnly(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "hibi.db")
-	st, err := OpenStore(path)
+	// A zero umask makes the result depend only on the code, not on the shell running the test.
+	defer syscall.Umask(syscall.Umask(0))
+	dir := t.TempDir()
+	loose := filepath.Join(dir, "old.db")
+	if err := os.WriteFile(loose, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{filepath.Join(dir, "new.db"), loose} {
+		st, err := OpenStore(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		st.Close()
+		fi, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fi.Mode().Perm() != 0o600 {
+			t.Errorf("%s mode: got %o, want 600", filepath.Base(path), fi.Mode().Perm())
+		}
+	}
+}
+
+func TestConcurrentWritesDoNotFail(t *testing.T) {
+	srv := setup(t)
+	var wg sync.WaitGroup
+	codes := make(chan int, 200)
+	for i := range 200 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			code, _ := call(t, srv, "PUT", fmt.Sprintf("/habits/2026-11-10/h%d", i%50), testToken, fmt.Sprintf(`{"value":%d}`, i))
+			codes <- code
+		}()
+	}
+	wg.Wait()
+	close(codes)
+	failed := 0
+	for c := range codes {
+		if c != 200 {
+			failed++
+		}
+	}
+	if failed != 0 {
+		t.Errorf("concurrent PUTs: %d of 200 failed", failed)
+	}
+}
+
+func TestAPIDetails(t *testing.T) {
+	srv := setup(t)
+	if code, body := call(t, srv, "GET", "/habits/2026-11-10", testToken, ""); code != 200 || strings.TrimSpace(body) != "[]" {
+		t.Errorf("empty habit list: got %d %q, want []", code, body)
+	}
+	if code, body := call(t, srv, "GET", "/entries", testToken, ""); code != 200 || strings.TrimSpace(body) != "[]" {
+		t.Errorf("empty entry list: got %d %q, want []", code, body)
+	}
+
+	req, _ := http.NewRequest("PUT", srv.URL+"/entries/2026-11-10", strings.NewReader(`{"body":"lower-case scheme"}`))
+	req.Header.Set("Authorization", "bearer "+testToken)
+	res, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
-	fi, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
+	res.Body.Close()
+	if res.StatusCode != 200 || res.Header.Get("Content-Type") != "application/json" {
+		t.Errorf("lower-case bearer: got %d %q, want 200 JSON", res.StatusCode, res.Header.Get("Content-Type"))
 	}
-	if fi.Mode().Perm() != 0o600 {
-		t.Errorf("db mode: got %o, want 600", fi.Mode().Perm())
+	if _, body := call(t, srv, "GET", "/entries", testToken, ""); !strings.Contains(body, `"2026-11-10"`) {
+		t.Errorf("list without bounds: got %s, want the 2026-11-10 entry", body)
+	}
+	big := `{"body":"` + strings.Repeat("a", maxBody) + `"}`
+	if code, _ := call(t, srv, "PUT", "/entries/2026-11-11", testToken, big); code != 413 {
+		t.Errorf("body over 1 MiB: got %d, want 413", code)
+	}
+	if code, _ := call(t, srv, "DELETE", "/entries/2026-11-10", testToken, ""); code != 204 {
+		t.Errorf("delete entry: got %d, want 204", code)
+	}
+	if code, _ := call(t, srv, "DELETE", "/entries/2026-11-10", testToken, ""); code != 404 {
+		t.Errorf("delete missing entry: got %d, want 404", code)
 	}
 }
 
@@ -143,6 +224,15 @@ func TestEntryRoundTripViaCLI(t *testing.T) {
 	}
 	if _, err := cli(t, "", "entry", "put", "2026-11-10", "rewritten"); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := cli(t, "", "entry", "put", "2026-11-07", "to delete"); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := cli(t, "", "entry", "delete", "2026-11-07"); err != nil || out != "" {
+		t.Fatalf("entry delete: got %q %v", out, err)
+	}
+	if _, err := cli(t, "", "entry", "get", "2026-11-07"); err == nil || !strings.Contains(err.Error(), "404") {
+		t.Fatalf("after entry delete: got %v, want 404", err)
 	}
 	if _, err := cli(t, "", "entry", "put", "2026-11-08", "older"); err != nil {
 		t.Fatal(err)
@@ -181,21 +271,31 @@ func TestEntryRoundTripViaCLI(t *testing.T) {
 
 func TestTodayUsesLocalDate(t *testing.T) {
 	setup(t)
-	if _, err := cli(t, "", "entry", "put", "today", "now"); err != nil {
-		t.Fatal(err)
-	}
-	out, err := cli(t, "", "entry", "get", time.Now().Format(time.DateOnly))
-	if err != nil || !strings.Contains(out, `"body":"now"`) {
-		t.Fatalf("today: got %s %v", out, err)
+	orig := time.Local
+	defer func() { time.Local = orig }()
+	// +14h and -12h are 26h apart, so their dates always differ: a day() that ignores time.Local fails one.
+	for _, off := range []int{14, -12} {
+		time.Local = time.FixedZone("test", off*3600)
+		before := time.Now().Format(time.DateOnly)
+		if _, err := cli(t, "", "entry", "put", "today", fmt.Sprintf("zone %d", off)); err != nil {
+			t.Fatal(err)
+		}
+		after := time.Now().Format(time.DateOnly)
+		out, _ := cli(t, "", "entry", "get", before)
+		out2, _ := cli(t, "", "entry", "get", after)
+		want := fmt.Sprintf(`"body":"zone %d"`, off)
+		if !strings.Contains(out, want) && !strings.Contains(out2, want) {
+			t.Errorf("today in UTC%+d: entry not on %s, got %s", off, before, out)
+		}
 	}
 }
 
 func TestHabitsViaCLI(t *testing.T) {
 	setup(t)
-	if _, err := cli(t, "", "habit", "done", "2026-11-10", "stretch"); err != nil {
+	if _, err := cli(t, "", "habit", "done", "2026-11-10", "walk", "10"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := cli(t, "", "habit", "done", "2026-11-10", "walk", "10"); err != nil {
+	if _, err := cli(t, "", "habit", "done", "2026-11-10", "stretch"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := cli(t, "", "habit", "done", "2026-11-10", "walk", "8123"); err != nil {
@@ -212,7 +312,7 @@ func TestHabitsViaCLI(t *testing.T) {
 	if err := json.Unmarshal([]byte(out), &hs); err != nil {
 		t.Fatal(err)
 	}
-	if len(hs) != 2 || hs[0].Habit != "stretch" || hs[0].Value != nil || hs[1].Value == nil || *hs[1].Value != 8123 {
+	if len(hs) != 2 || hs[0].Habit != "stretch" || hs[0].Value != nil || hs[1].Habit != "walk" || hs[1].Value == nil || *hs[1].Value != 8123 {
 		t.Fatalf("habit list: got %s", out)
 	}
 
@@ -236,11 +336,61 @@ func TestCLIUsage(t *testing.T) {
 	if _, err := cli(t, "", "entry", "frobnicate"); err != errUsage {
 		t.Errorf("unknown command: got %v, want usage error", err)
 	}
-	if _, err := cli(t, "", "habit", "done", "2026-11-10", "walk", "lots"); err == nil || !strings.Contains(err.Error(), "VALUE must be a number") {
-		t.Errorf("non-numeric value: got %v, want a client-side number error", err)
+	for _, v := range []string{"lots", "NaN", "Inf"} {
+		if _, err := cli(t, "", "habit", "done", "2026-11-10", "walk", v); err == nil || !strings.Contains(err.Error(), "VALUE must be a finite number") {
+			t.Errorf("value %q: got %v, want a client-side number error", v, err)
+		}
+	}
+	if _, err := cli(t, "", "entry", "list", "2026-11-01"); err != errUsage {
+		t.Errorf("entry list with a positional arg: got %v, want usage error", err)
 	}
 	t.Setenv("HIBI_TOKEN", "")
 	if _, err := cli(t, "", "entry", "list"); err == nil || !strings.Contains(err.Error(), "HIBI_URL and HIBI_TOKEN are required") {
 		t.Errorf("missing HIBI_TOKEN: got %v, want a client-side config error", err)
+	}
+}
+
+func TestServeStartsAndShutsDownOnSignal(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := l.Addr().String()
+	l.Close()
+	t.Setenv("HIBI_TOKEN", testToken)
+	t.Setenv("HIBI_DB", filepath.Join(t.TempDir(), "hibi.db"))
+	t.Setenv("HIBI_ADDR", addr)
+
+	done := make(chan error, 1)
+	go func() { done <- run([]string{"serve"}, strings.NewReader(""), io.Discard) }()
+	up := false
+	for range 50 {
+		if res, err := http.Get("http://" + addr + "/healthz"); err == nil {
+			res.Body.Close()
+			up = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !up {
+		t.Fatal("serve did not answer /healthz within 1s")
+	}
+	start := time.Now()
+	syscall.Kill(os.Getpid(), syscall.SIGINT)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("serve after SIGINT: got %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve did not stop within 5s of SIGINT")
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Errorf("shutdown took %v, want under 2s", d)
+	}
+
+	t.Setenv("HIBI_TOKEN", "")
+	if err := run([]string{"serve"}, strings.NewReader(""), io.Discard); err == nil || !strings.Contains(err.Error(), "HIBI_TOKEN is required") {
+		t.Errorf("serve without token: got %v", err)
 	}
 }

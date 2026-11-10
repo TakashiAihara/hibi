@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"regexp"
+	"strings"
 	"time"
 )
 
@@ -58,6 +59,10 @@ func NewServer(st *Store, token string) http.Handler {
 		respond(w, e, err)
 	}))
 
+	mux.HandleFunc("DELETE /entries/{date}", withDate(func(w http.ResponseWriter, r *http.Request, date string) {
+		noContent(w, st.DeleteEntry(date))
+	}))
+
 	mux.HandleFunc("GET /habits/{date}", withDate(func(w http.ResponseWriter, r *http.Request, date string) {
 		hs, err := st.ListHabits(date)
 		respond(w, hs, err)
@@ -74,21 +79,19 @@ func NewServer(st *Store, token string) http.Handler {
 		respond(w, h, err)
 	}))
 	mux.HandleFunc("DELETE /habits/{date}/{habit}", withHabit(func(w http.ResponseWriter, r *http.Request, date, habit string) {
-		err := st.DeleteHabit(date, habit)
-		if err == nil {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		respond(w, nil, err)
+		noContent(w, st.DeleteHabit(date, habit))
 	}))
 
 	return auth(token, mux)
 }
 
 func auth(token string, next http.Handler) http.Handler {
-	want := []byte("Bearer " + token)
+	want := []byte(token)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/healthz" && subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), want) != 1 {
+		// The auth scheme is case-insensitive (RFC 9110 11.1); webhook senders may send "bearer".
+		scheme, cred, _ := strings.Cut(r.Header.Get("Authorization"), " ")
+		ok := strings.EqualFold(scheme, "Bearer") && subtle.ConstantTimeCompare([]byte(cred), want) == 1
+		if r.URL.Path != "/healthz" && !ok {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="hibi"`)
 			httpErr(w, http.StatusUnauthorized, "unauthorized")
 			return
@@ -119,6 +122,14 @@ func withHabit(h func(http.ResponseWriter, *http.Request, string, string)) http.
 	})
 }
 
+func noContent(w http.ResponseWriter, err error) {
+	if err == nil {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	respond(w, nil, err)
+}
+
 func decode(w http.ResponseWriter, r *http.Request, v any) bool {
 	return decodeBody(w, r, v, false)
 }
@@ -136,6 +147,11 @@ func decodeBody(w http.ResponseWriter, r *http.Request, v any, allowEmpty bool) 
 	}
 	if err == nil && dec.Decode(&struct{}{}) != io.EOF {
 		err = errors.New("trailing data after JSON value")
+	}
+	var tooBig *http.MaxBytesError
+	if errors.As(err, &tooBig) {
+		httpErr(w, http.StatusRequestEntityTooLarge, "request body over 1 MiB")
+		return false
 	}
 	if err != nil {
 		httpErr(w, http.StatusBadRequest, "invalid JSON: "+err.Error())

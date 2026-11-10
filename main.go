@@ -2,17 +2,21 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -25,6 +29,7 @@ Client (env: HIBI_URL, HIBI_TOKEN). DATE is YYYY-MM-DD or "today":
   hibi entry get DATE
   hibi entry put DATE [TEXT]         TEXT defaults to stdin
   hibi entry list [-from DATE] [-to DATE]
+  hibi entry delete DATE
   hibi habit list DATE
   hibi habit done DATE HABIT [VALUE]
   hibi habit undo DATE HABIT
@@ -74,6 +79,9 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 		if err := fs.Parse(rest); err != nil {
 			return err
 		}
+		if fs.NArg() > 0 {
+			return errUsage
+		}
 		q := url.Values{}
 		if *from != "" {
 			q.Set("from", day(*from))
@@ -82,14 +90,16 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 			q.Set("to", day(*to))
 		}
 		return c.do("GET", "/entries?"+q.Encode(), nil, stdout)
+	case cmd == "entry delete" && len(rest) == 1:
+		return c.do("DELETE", "/entries/"+day(rest[0]), nil, stdout)
 	case cmd == "habit list" && len(rest) == 1:
 		return c.do("GET", "/habits/"+day(rest[0]), nil, stdout)
 	case cmd == "habit done" && (len(rest) == 2 || len(rest) == 3):
 		var body any
 		if len(rest) == 3 {
 			v, err := strconv.ParseFloat(rest[2], 64)
-			if err != nil {
-				return fmt.Errorf("VALUE must be a number: %w", err)
+			if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
+				return fmt.Errorf("VALUE must be a finite number: %q", rest[2])
 			}
 			body = map[string]float64{"value": v}
 		}
@@ -118,10 +128,22 @@ func serve() error {
 	}
 	defer st.Close()
 	addr := envOr("HIBI_ADDR", ":8080")
-	log.Printf("listening on %s", addr)
 	srv := &http.Server{Addr: addr, Handler: NewServer(st, token),
 		ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 2 * time.Minute}
-	return srv.ListenAndServe()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	errc := make(chan error, 1)
+	go func() { errc <- srv.ListenAndServe() }()
+	log.Printf("listening on %s, db %s", addr, envOr("HIBI_DB", "hibi.db"))
+	select {
+	case err := <-errc:
+		return err
+	case <-ctx.Done():
+		// Let in-flight writes finish before the deferred store close on container stop.
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		return srv.Shutdown(shutdownCtx)
+	}
 }
 
 func envOr(k, def string) string {
