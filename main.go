@@ -26,7 +26,7 @@ const usage = `hibi: personal diary and habit tracker
 Server:
   hibi serve                         env: HIBI_TOKEN (required), HIBI_DB (hibi.db), HIBI_ADDR (:8080)
 
-Client (env: HIBI_URL, HIBI_TOKEN). DATE is YYYY-MM-DD or "today":
+Client (env: HIBI_URL, HIBI_TOKEN). DATE is YYYY-MM-DD, or "today" (the diary day, which starts at 05:00 local time):
   hibi entry get DATE
   hibi entry put DATE [TEXT]         TEXT defaults to stdin
   hibi entry list [-from DATE] [-to DATE]
@@ -111,17 +111,31 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 	return errUsage
 }
 
-// cliZone is the zone "today" resolves in; a variable so tests can set it without racing on time.Local.
-var cliZone = time.Local
+// cliZone and cliNow are what "today" resolves against; variables so tests can set them without racing on time.Local.
+var (
+	cliZone = time.Local
+	cliNow  = time.Now
+)
+
+// The diary day starts at 05:00: an entry or habit written at 01:00 belongs to the evening before.
+const dayStartHour = 5
 
 // day is a DATE argument as a path segment; query values use resolveDay, since Encode escapes them.
 func day(s string) string { return url.PathEscape(resolveDay(s)) }
 
 func resolveDay(s string) string {
 	if s == "today" {
-		return time.Now().In(cliZone).Format(time.DateOnly)
+		return diaryDay(cliNow().In(cliZone))
 	}
 	return s
+}
+
+// diaryDay expects t in the CLI's zone. It compares the local hour, not t minus 5h, so DST changeover days still switch at 05:00 on the clock.
+func diaryDay(t time.Time) string {
+	if t.Hour() < dayStartHour {
+		t = t.AddDate(0, 0, -1)
+	}
+	return t.Format(time.DateOnly)
 }
 
 func serve() error {

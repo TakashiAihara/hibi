@@ -12,4 +12,5 @@
 | habit | A name for something tracked daily (`walk`, `stretch`, `hatebu`). Not stored on its own yet | path segment `{habit}`, column `habit_logs.habit` |
 | habit log | The record that a habit happened on a date, with an optional number (steps, minutes) | table `habit_logs`, type `HabitLog`, `/habits/{date}/{habit}` |
 | value | The optional number on a habit log. `null` means a plain done check | column `habit_logs.value` |
-| date | A calendar day as `YYYY-MM-DD`, stored as the client sends it. The CLI's `today` uses the time zone of the machine running the CLI | primary keys of both tables |
+| date | A calendar day as `YYYY-MM-DD`, stored as the client sends it | primary keys of both tables |
+| diary day | The date an entry or habit log belongs to. It starts at 05:00, so anything written before 05:00 belongs to the previous date. An explicit date always wins. The CLI's `today` resolves to the diary day in the time zone of the machine running the CLI | `diaryDay` in `main.go` |

@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	_ "time/tzdata"
 )
 
 const testToken = "s3cret"
@@ -289,23 +290,76 @@ func TestEntryRoundTripViaCLI(t *testing.T) {
 	}
 }
 
-func TestTodayUsesLocalDate(t *testing.T) {
-	setup(t)
-	orig := cliZone
-	defer func() { cliZone = orig }()
-	// +14h and -12h are 26h apart, so their dates always differ: a day() that ignores cliZone fails one.
-	for _, off := range []int{14, -12} {
-		cliZone = time.FixedZone("test", off*3600)
-		before := time.Now().In(cliZone).Format(time.DateOnly)
-		if _, err := cli(t, "", "entry", "put", "today", fmt.Sprintf("zone %d", off)); err != nil {
+func TestDiaryDayStartsAt5(t *testing.T) {
+	jst := time.FixedZone("JST", 9*3600)
+	cases := []struct{ at, want string }{
+		{"2026-11-11T00:00", "2026-11-10"},
+		{"2026-11-11T04:59", "2026-11-10"},
+		{"2026-11-11T05:00", "2026-11-11"},
+		{"2026-11-11T23:59", "2026-11-11"},
+	}
+	for _, c := range cases {
+		tm, err := time.ParseInLocation("2006-01-02T15:04", c.at, jst)
+		if err != nil {
 			t.Fatal(err)
 		}
-		after := time.Now().In(cliZone).Format(time.DateOnly)
-		out, _ := cli(t, "", "entry", "get", before)
-		out2, _ := cli(t, "", "entry", "get", after)
-		want := fmt.Sprintf(`"body":"zone %d"`, off)
-		if !strings.Contains(out, want) && !strings.Contains(out2, want) {
-			t.Errorf("today in UTC%+d: entry not on %s, got %s", off, before, out)
+		if got := diaryDay(tm); got != c.want {
+			t.Errorf("diaryDay(%s): got %s, want %s", c.at, got, c.want)
+		}
+	}
+
+	// On DST changeover days the boundary is still 05:00 on the wall clock.
+	ny, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct{ at, want string }{
+		{"2026-03-08T05:30", "2026-03-08"},
+		{"2026-03-08T04:30", "2026-03-07"},
+		{"2026-11-01T04:30", "2026-10-31"},
+		{"2026-11-01T05:30", "2026-11-01"},
+	} {
+		tm, err := time.ParseInLocation("2006-01-02T15:04", c.at, ny)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := diaryDay(tm); got != c.want {
+			t.Errorf("diaryDay(%s New York): got %s, want %s", c.at, got, c.want)
+		}
+	}
+}
+
+func TestTodayResolvesInCLIZone(t *testing.T) {
+	setup(t)
+	origZone, origNow := cliZone, cliNow
+	defer func() { cliZone, cliNow = origZone, origNow }()
+	// 2026-11-10 20:00 UTC is 11-11 10:00 at +14h and 11-10 08:00 at -12h: both past 05:00, different dates.
+	cliNow = func() time.Time { return time.Date(2026, 11, 10, 20, 0, 0, 0, time.UTC) }
+	for _, c := range []struct {
+		off  int
+		want string
+	}{{14, "2026-11-11"}, {-12, "2026-11-10"}} {
+		cliZone = time.FixedZone("test", c.off*3600)
+		if _, err := cli(t, "", "entry", "put", "today", fmt.Sprintf("zone %d", c.off)); err != nil {
+			t.Fatal(err)
+		}
+		out, err := cli(t, "", "entry", "get", c.want)
+		if err != nil || !strings.Contains(out, fmt.Sprintf(`"body":"zone %d"`, c.off)) {
+			t.Errorf("today at UTC%+d: want the entry on %s, got %s %v", c.off, c.want, out, err)
+		}
+	}
+	// At 03:00 JST on 11-11, "today" is the 10th; an explicit 11-11 is still the 11th.
+	cliNow = func() time.Time { return time.Date(2026, 11, 10, 18, 0, 0, 0, time.UTC) }
+	cliZone = time.FixedZone("JST", 9*3600)
+	if _, err := cli(t, "", "entry", "put", "today", "late night"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cli(t, "", "entry", "put", "2026-11-11", "explicit"); err != nil {
+		t.Fatal(err)
+	}
+	for date, want := range map[string]string{"2026-11-10": "late night", "2026-11-11": "explicit"} {
+		if out, err := cli(t, "", "entry", "get", date); err != nil || !strings.Contains(out, `"body":"`+want+`"`) {
+			t.Errorf("at 03:00 JST, %s: got %s %v, want %q", date, out, err, want)
 		}
 	}
 }
