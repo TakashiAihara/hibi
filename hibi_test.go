@@ -348,14 +348,19 @@ func TestTodayResolvesInCLIZone(t *testing.T) {
 			t.Errorf("today at UTC%+d: want the entry on %s, got %s %v", c.off, c.want, out, err)
 		}
 	}
-	// An explicit date is used as given, even before 05:00.
+	// At 03:00 JST on 11-11, "today" is the 10th; an explicit 11-11 is still the 11th.
 	cliNow = func() time.Time { return time.Date(2026, 11, 10, 18, 0, 0, 0, time.UTC) }
 	cliZone = time.FixedZone("JST", 9*3600)
-	if got := resolveDay("2026-11-11"); got != "2026-11-11" {
-		t.Errorf("explicit date at 03:00: got %s, want 2026-11-11", got)
+	if _, err := cli(t, "", "entry", "put", "today", "late night"); err != nil {
+		t.Fatal(err)
 	}
-	if got := resolveDay("today"); got != "2026-11-10" {
-		t.Errorf("today at 03:00 JST: got %s, want 2026-11-10", got)
+	if _, err := cli(t, "", "entry", "put", "2026-11-11", "explicit"); err != nil {
+		t.Fatal(err)
+	}
+	for date, want := range map[string]string{"2026-11-10": "late night", "2026-11-11": "explicit"} {
+		if out, err := cli(t, "", "entry", "get", date); err != nil || !strings.Contains(out, `"body":"`+want+`"`) {
+			t.Errorf("at 03:00 JST, %s: got %s %v, want %q", date, out, err, want)
+		}
 	}
 }
 

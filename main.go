@@ -117,7 +117,7 @@ var (
 	cliNow  = time.Now
 )
 
-// The diary day starts at 05:00: a reply written at 01:00 belongs to the evening before.
+// The diary day starts at 05:00: an entry or habit written at 01:00 belongs to the evening before.
 const dayStartHour = 5
 
 // day is a DATE argument as a path segment; query values use resolveDay, since Encode escapes them.
@@ -130,7 +130,7 @@ func resolveDay(s string) string {
 	return s
 }
 
-// diaryDay compares the local hour, not t minus 5h, so DST changeover days still switch at 05:00 on the clock.
+// diaryDay expects t in the CLI's zone. It compares the local hour, not t minus 5h, so DST changeover days still switch at 05:00 on the clock.
 func diaryDay(t time.Time) string {
 	if t.Hour() < dayStartHour {
 		t = t.AddDate(0, 0, -1)
