@@ -130,8 +130,12 @@ func resolveDay(s string) string {
 	return s
 }
 
+// diaryDay compares the local hour, not t minus 5h, so DST changeover days still switch at 05:00 on the clock.
 func diaryDay(t time.Time) string {
-	return t.Add(-dayStartHour * time.Hour).Format(time.DateOnly)
+	if t.Hour() < dayStartHour {
+		t = t.AddDate(0, 0, -1)
+	}
+	return t.Format(time.DateOnly)
 }
 
 func serve() error {

@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	_ "time/tzdata"
 )
 
 const testToken = "s3cret"
@@ -304,6 +305,26 @@ func TestDiaryDayStartsAt5(t *testing.T) {
 		}
 		if got := diaryDay(tm); got != c.want {
 			t.Errorf("diaryDay(%s): got %s, want %s", c.at, got, c.want)
+		}
+	}
+
+	// On DST changeover days the boundary is still 05:00 on the wall clock.
+	ny, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct{ at, want string }{
+		{"2026-03-08T05:30", "2026-03-08"},
+		{"2026-03-08T04:30", "2026-03-07"},
+		{"2026-11-01T04:30", "2026-10-31"},
+		{"2026-11-01T05:30", "2026-11-01"},
+	} {
+		tm, err := time.ParseInLocation("2006-01-02T15:04", c.at, ny)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := diaryDay(tm); got != c.want {
+			t.Errorf("diaryDay(%s New York): got %s, want %s", c.at, got, c.want)
 		}
 	}
 }
